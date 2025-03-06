@@ -1,0 +1,239 @@
+name: Build OnePlus 11 Android 13 5.15 Kernel Clean Script
+
+on:
+  workflow_dispatch:
+    inputs:
+      manual_hooks:
+        description: 'Build OP 11 kernel with Manual Hooks?'
+        required: true
+        type: boolean
+        default: true
+      ksu_next_version:
+        description: 'KernelSU Next version building'
+        required: true
+        type: string
+        default: "1.0.5"
+      susfs_version:
+        description: 'SUSFS version building'
+        required: true
+        type: string
+        default: "1.5.5"
+      ksu_branch:
+        description: 'KernelSU Next branch Name'
+        required: true
+        type: choice
+        options: 
+        - next
+        - next-susfs
+        default: "next"
+      ksu_branch_stable:
+        description: 'KernelSU Next branch Name'
+        required: true
+        type: boolean
+        default: true
+  workflow_call:  # This allows this workflow to be called from another workflow
+  
+jobs:
+  build-kernel-a13-5-15-kernelsu-next-susfs-clean:
+    runs-on: ubuntu-local
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Step 1
+        run: |
+          set -v
+          rm -rf $GITHUB_WORKSPACE/*
+          free -h
+          df -h
+
+          # Set CONFIG dynamically based on matrix values
+          CONFIG="op11"
+          
+          # Set CONFIG as an environment variable for future steps
+          echo "CONFIG=$CONFIG" >> $GITHUB_ENV
+          
+          echo "CONFIG set to: $CONFIG"
+          
+          # Install dependencies
+          mkdir -p ./git-repo
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ./git-repo/repo
+          chmod a+rx ./git-repo/repo
+          echo "REPO=$GITHUB_WORKSPACE/./git-repo/repo" >> $GITHUB_ENV
+
+          sudo apt update
+          sudo apt install zip rsync -y
+
+          echo "Cloning AnyKernel3 and other dependencies..."
+          
+          # Define the branch names using the matrix values
+          ANYKERNEL_BRANCH="gki-2.0"
+          SUSFS_BRANCH="gki-android13-5.15"
+          
+          # Debug print the branches
+          echo "Using branch for AnyKernel3: $ANYKERNEL_BRANCH"
+          echo "Using branch for SUSFS: $SUSFS_BRANCH"
+          
+          git config --global color.ui false
+          
+          # Clone repositories using the branch names
+          git clone https://github.com/TheWildJames/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
+          git clone https://github.com/TheWildJames/kernel_patches.git
+          # Clone Personal Patches if any
+          #git clone https://github.com/fatalcoder524/kernel_patches_additional.git
+          
+          
+      - name: Build Kernel
+        run: |
+          echo "Creating folder for configuration: $CONFIG..."
+          mkdir -p "$CONFIG"
+          cd "$CONFIG"
+          # Initialize and sync kernel source
+          echo "Initializing and syncing kernel source..."
+          $REPO init -u https://github.com/OnePlusOSS/kernel_manifest.git -b oneplus/sm8550 -m oneplus_11_v.xml --repo-rev=v2.16 --depth=1
+          
+          # Sync repo and apply patches
+          $REPO --version
+          $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast
+          
+          echo "Changing to configuration directory: $CONFIG..."
+          cd kernel_platform          
+          echo "Adding KernelSU Next..."
+          if [[ ${{ github.event.inputs.ksu_branch_stable }} == true && "${{ github.event.inputs.ksu_branch }}" == "next" ]]; then
+            echo "Using stable branch for KernelSU Next..."
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${{ github.event.inputs.ksu_branch }}/kernel/setup.sh" | bash -
+          else
+            echo "Using ${{ github.event.inputs.ksu_branch }} branch for KernelSU Next..."
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${{ github.event.inputs.ksu_branch }}/kernel/setup.sh" | bash -s ${{ github.event.inputs.ksu_branch }}
+          fi
+          
+          cd ./KernelSU-Next/kernel
+          # sed -i -e 's/ccflags-y += -DKSU_VERSION=11998/ccflags-y += -DKSU_VERSION=12000/' -e 's/$(eval KSU_VERSION=$(shell expr 10000 + $(KSU_GIT_VERSION) + 200))/$(eval KSU_VERSION=$(shell expr 10000 + $(KSU_GIT_VERSION) + 200))/' ./Makefile
+          
+          echo "Changing to configuration directory: $CONFIG..."
+          cd ../../
+          
+          echo "Applying SUSFS patches..."
+          
+          # Copy SUSFS patches
+          cp ../../kernel_patches/0001-kernel-patch-susfs-v1.5.5-to-KernelSU-Next-v1.0.5.patch ./KernelSU-Next/
+          # cp ../../kernel_patches_additional/add-pixelify-umount.patch ./KernelSU-Next/
+          cp ../../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch ./common/
+          cp ../../susfs4ksu/kernel_patches/fs/* ./common/fs/
+          cp ../../susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+          cp ../../kernel_patches/69_hide_stuff.patch ./common/
+          cp ../../kernel_patches/new_hooks.patch ./common/
+          
+          cd ./KernelSU-Next
+
+          if [[ "${{ github.event.inputs.ksu_branch }}" == "next" ]]; then
+            echo "Applying next SUSFS patches..."
+            patch -p1 < 0001-kernel-patch-susfs-v1.5.5-to-KernelSU-Next-v1.0.5.patch || true
+          fi
+
+          # echo "Applying next Pixelify Umount patches..."
+          # patch -p1 < add-pixelify-umount.patch || true
+          
+          # Change to common directory and apply SUSFS patch
+          cd ../common
+          echo "Applying gki-android13-5.15 patches..."
+          patch -p1 < 50_add_susfs_in_gki-android13-5.15.patch || true
+          echo "Applying hide patches..."
+          patch -p1 -F 3 < 69_hide_stuff.patch
+          if [[ ${{ github.event.inputs.manual_hooks }} == true ]]; then
+            echo "Applying Manual Hooks patches..."
+            patch -p1 --forward < new_hooks.patch
+          fi
+          
+          echo "Changing to configuration directory: $CONFIG..."
+          cd ../
+          
+          echo "Adding configuration settings to gki_defconfig..."
+          
+          # Add SUSFS configuration settings
+          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          if [[ ${{ github.event.inputs.manual_hooks }} == true ]]; then
+            echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_WITH_KPROBES=n" >> ./common/arch/arm64/configs/gki_defconfig
+          else
+            echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_WITH_KPROBES=y" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          
+          # Add additional tmpfs config setting
+          echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          
+          # Add additional tmpfs config setting
+          echo "CONFIG_IP_NF_TARGET_TTL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP6_NF_TARGET_HL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP6_NF_MATCH_HL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          
+          echo "Running sed commands..."
+          # Run sed commands for modifications
+          sed -i 's/check_defconfig//' ./common/build.config.gki
+          sed -i '$s|echo "\$res"|echo "\$res-fatalcoder524"|' ./common/scripts/setlocalversion
+          sed -i '$s|echo "\$res"|echo "\$res-fatalcoder524"|' ./msm-kernel/scripts/setlocalversion
+          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
+          sed -i 's/-dirty//' ./common/scripts/setlocalversion
+          sed -i 's/-dirty//' ./msm-kernel/scripts/setlocalversion
+          sed -i 's/local default_value=none/local default_value=thin/' ./oplus/build/oplus_setup.sh
+          sed -i 's/local default_value=enable/local default_value=disable/' ./oplus/build/oplus_setup.sh
+          sed -i 's/read ANSWER/ANSWER=$default_value/g' ./oplus/build/oplus_setup.sh
+          
+          # FOLDER=$(date +'%d-%m-%Y %H-%M-%S')
+          DATESTR=$(date -u)
+          # Run perl command to modify UTS_VERSION
+          perl -pi -e "s{UTS_VERSION=\"\\\$\\(echo \\\$UTS_VERSION \\\$CONFIG_FLAGS \\\$TIMESTAMP \\| cut -b -\\\$UTS_LEN\\)\"}{UTS_VERSION=\"#1 SMP PREEMPT $DATESTR\"}" ./common/scripts/mkcompile_h
+          
+          echo "Changing to configuration directory: $CONFIG..."
+          cd ../
+          
+          echo "Building the kernel..."
+          rm -rf ./kernel_platform/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          rm ./msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh kalama gki
+          
+          echo "Copying Image"
+          cp ./out/dist/Image ../AnyKernel3/Image
+          # mkdir "/home/user/output_image/$FOLDER"
+          # cp ./out/dist/Image "/home/user/output_image/$FOLDER"
+          
+          echo "Creating zip files for all formats..."
+          cd ../AnyKernel3
+          
+          ZIP_NAME="Anykernel3-OP11-A15-android13-5.15-KernelSU-Next-${{ github.event.inputs.ksu_next_version }}-latest-SUSFS-${{ github.event.inputs.susfs_version }}.zip"
+          echo "Creating zip file $ZIP_NAME..."
+          zip -r "../$ZIP_NAME" ./*
+
+          # echo "Copying output zip file"
+          # cp "../$ZIP_NAME" "/home/user/output_image/$FOLDER/$ZIP_NAME"
+
