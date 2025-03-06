@@ -35,7 +35,7 @@ on:
   
 jobs:
   build-kernel-a13-5-15-kernelsu-next-susfs-clean:
-    runs-on: ubuntu-local
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
